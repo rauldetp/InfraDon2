@@ -1,0 +1,15 @@
+{
+    "_id": "user:raul.gomezcal",
+    "_rev": "1-61cf6df87076355b74958649a6f2f3af",
+    "type": "user",
+    "name": {
+      "first": "Raul",
+      "last": "Gomez"
+    },
+    "email": "raul.gomezcal@hes-so.ch",
+    "tags": [
+      "student",
+      "heig-vd"
+    ],
+    "created_at": "2025-10-09T10:39:00Z"
+  }
