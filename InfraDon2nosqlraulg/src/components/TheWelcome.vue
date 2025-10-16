@@ -2,28 +2,25 @@
 import { ref, onMounted } from 'vue'
 import PouchDB from 'pouchdb'
 
-// Définition du type utilisateur (ta structure CouchDB)
 interface UserDoc {
   _id?: string
   _rev?: string
-  type: string
-  name: {
-    first: string
-    last: string
+  type?: string
+  name?: {
+    first?: string
+    last?: string
   }
-  email: string
-  tags: string[]
-  created_at: string
+  email?: string
+  tags?: string[]
+  created_at?: string
 }
 
-// On crée une instance typée de PouchDB
 const db = ref<PouchDB.Database<UserDoc> | null>(null)
 const users = ref<UserDoc[]>([])
 
-// Connexion à CouchDB
 function connectToCouchDB(): void {
   try {
-    const database: PouchDB.Database<UserDoc> = new PouchDB('http://admin:Mbappevini135@127.0.0.1:5984/vini')
+    const database: PouchDB.Database<UserDoc> = new PouchDB('http://admin:MbappeVini135@127.0.0.1:5984/vini')
     db.value = database
     console.log('Connecté à CouchDB')
   } catch (error) {
@@ -31,7 +28,6 @@ function connectToCouchDB(): void {
   }
 }
 
-// Lecture des utilisateurs
 async function fetchUsers(): Promise<void> {
   if (!db.value) {
     console.warn('Base non initialisée')
@@ -40,10 +36,10 @@ async function fetchUsers(): Promise<void> {
 
   try {
     const result = await db.value.allDocs<UserDoc>({ include_docs: true })
-    const rows = result.rows as Array<{ doc?: UserDoc }>
-    users.value = rows
-      .filter(row => !!row.doc)
-      .map(row => row.doc as UserDoc)
+    console.log('Résultat brut depuis CouchDB :', result)
+
+    const rows = result.rows.filter(row => row.doc)
+    users.value = rows.map(row => row.doc as UserDoc)
 
     console.log('Utilisateurs récupérés :', users.value)
   } catch (error) {
@@ -51,7 +47,6 @@ async function fetchUsers(): Promise<void> {
   }
 }
 
-// Initialisation automatique
 onMounted(() => {
   connectToCouchDB()
   setTimeout(fetchUsers, 500)
@@ -71,9 +66,9 @@ onMounted(() => {
       :key="user._id"
       style="margin-bottom:1rem;padding:1rem;border:1px solid #ccc;border-radius:8px;"
     >
-      <h2>{{ user.name.first }} {{ user.name.last }}</h2>
+      <h2>{{ user.name?.first }} {{ user.name?.last }}</h2>
       <p><strong>Email :</strong> {{ user.email }}</p>
-      <p><strong>Tags :</strong> {{ user.tags.join(', ') }}</p>
+      <p><strong>Tags :</strong> {{ user.tags?.join(', ') }}</p>
       <small><strong>Créé le :</strong> {{ user.created_at }}</small>
     </article>
   </section>
