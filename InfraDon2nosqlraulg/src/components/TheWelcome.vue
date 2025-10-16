@@ -2,7 +2,7 @@
 import { ref, onMounted } from 'vue'
 import PouchDB from 'pouchdb'
 
-// Définition du type utilisateur (ta structure CouchDB)
+// Définition du type utilisateur (structure de ton document CouchDB)
 interface UserDoc {
   _id?: string
   _rev?: string
@@ -16,7 +16,7 @@ interface UserDoc {
   created_at: string
 }
 
-// On crée une instance typée de PouchDB
+// Base typée CouchDB
 const db = ref<PouchDB.Database<UserDoc> | null>(null)
 const users = ref<UserDoc[]>([])
 
@@ -25,29 +25,28 @@ function connectToCouchDB(): void {
   try {
     const database: PouchDB.Database<UserDoc> = new PouchDB('http://admin:MbappeVini135@127.0.0.1:5984/vini')
     db.value = database
-    console.log('Connecté à CouchDB')
+    console.log('✅ Connecté à CouchDB')
   } catch (error) {
-    console.error('Erreur de connexion :', error)
+    console.error('❌ Erreur de connexion :', error)
   }
 }
 
 // Lecture des utilisateurs
 async function fetchUsers(): Promise<void> {
   if (!db.value) {
-    console.warn('Base non initialisée')
+    console.warn('⚠️ Base non initialisée')
     return
   }
 
   try {
-    const result = await db.value.allDocs<UserDoc>({ include_docs: true })
-    const rows = result.rows as Array<{ doc?: UserDoc }>
-    users.value = rows
+    const result = await db.value.allDocs({ include_docs: true })
+    users.value = result.rows
       .filter(row => !!row.doc)
       .map(row => row.doc as UserDoc)
 
-    console.log('Utilisateurs récupérés :', users.value)
+    console.log('✅ Utilisateurs récupérés :', users.value)
   } catch (error) {
-    console.error('Erreur de lecture CouchDB :', error)
+    console.error('❌ Erreur de lecture CouchDB :', error)
   }
 }
 
@@ -59,7 +58,7 @@ onMounted(() => {
 </script>
 
 <template>
-  <section style="padding:2rem;background:#f9f9f9;">
+  <section style="padding:2rem;background:#f9f9f9;color:black;">
     <h1>Connexion à CouchDB</h1>
 
     <div v-if="users.length === 0">
@@ -69,7 +68,7 @@ onMounted(() => {
     <article
       v-for="user in users"
       :key="user._id"
-      style="margin-bottom:1rem;padding:1rem;border:1px solid #ccc;border-radius:8px;"
+      style="margin-bottom:1rem;padding:1rem;border:1px solid #ccc;border-radius:8px;background:white;color:black;"
     >
       <h2>{{ user.name.first }} {{ user.name.last }}</h2>
       <p><strong>Email :</strong> {{ user.email }}</p>
