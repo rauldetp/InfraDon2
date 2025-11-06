@@ -2,26 +2,27 @@
 import { ref, onMounted } from 'vue'
 import PouchDB from 'pouchdb'
 
-// Définition stricte du type d'utilisateur
+/** Modèle strict d'un utilisateur stocké dans CouchDB */
 interface UserDoc {
   _id?: string
   _rev?: string
-  type?: string
-  name: {
-    first: string
-    last: string
-  }
+  type: 'user'
+  name: { first: string; last: string }
   email: string
   tags: string[]
   created_at: string
+  updated_at?: string
+  /** champ UI local, non persisté si on veut l’ignorer */
   editing?: boolean
 }
 
-// Références réactives
+/* =========================
+   Références réactives
+   ========================= */
 const db = ref<PouchDB.Database<UserDoc> | null>(null)
-const users = ref<Array<UserDoc>>([])
+const users = ref<UserDoc[]>([])
 
-// Modèle de création
+/* Modèle pour le formulaire d'ajout */
 const newUser = ref<UserDoc>({
   type: 'user',
   name: { first: '', last: '' },
@@ -30,180 +31,280 @@ const newUser = ref<UserDoc>({
   created_at: ''
 })
 
-// Connexion à CouchDB
+/* =========================
+   Connexion CouchDB distante
+   ========================= */
 function connectToCouchDB(): void {
   try {
-    const database = new PouchDB<UserDoc>('http://admin:MbappeVini135@127.0.0.1:5984/vini')
-    db.value = database
-    console.log('Connecté à CouchDB')
+    // ⚠️ Assure-toi que CORS est activé dans CouchDB (voir note en bas)
+    const remote = new PouchDB<UserDoc>('http://admin:MbappeVini135@127.0.0.1:5984/vini')
+    db.value = remote
+    console.log('Connecté à CouchDB (base: vini)')
   } catch (error) {
-    console.error('Erreur de connexion :', error)
+    console.error('Erreur de connexion CouchDB :', error)
   }
 }
 
-// Lecture (FETCH)
+/* =========================
+   READ — récupérer tous les docs
+   ========================= */
 async function fetchUsers(): Promise<void> {
   if (!db.value) return
   try {
     const result = await db.value.allDocs({ include_docs: true })
     users.value = result.rows
-      .filter(row => !!row.doc)
-      .map(row => ({ ...(row.doc as UserDoc), editing: false }))
+      .filter(r => r.doc)
+      .map(r => {
+        const d = r.doc as UserDoc
+        return { ...d, editing: false }
+      })
+      // tri simple par date de création descendante
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
   } catch (error) {
-    console.error('Erreur de lecture CouchDB :', error)
+    console.error('Erreur de lecture (allDocs) :', error)
   }
 }
 
-// Création (CREATE)
+/* =========================
+   CREATE — ajouter un document
+   ========================= */
 async function addUser(): Promise<void> {
   if (!db.value) return
-  if (!newUser.value.name.first || !newUser.value.email) {
-    alert('Nom et email obligatoires')
+
+  if (!newUser.value.name.first.trim() || !newUser.value.email.trim()) {
+    alert('Prénom et email sont obligatoires.')
     return
   }
 
+  // ID déterministe basé sur prénom.nom + timestamp pour éviter les conflits
+  const baseId = `user:${newUser.value.name.first.toLowerCase()}.${(newUser.value.name.last || '').toLowerCase()}`
+  const _id = `${baseId}:${Date.now()}`
+
   const userToAdd: UserDoc = {
-    _id: `user:${newUser.value.name.first.toLowerCase()}.${newUser.value.name.last.toLowerCase()}`,
+    _id,
     type: 'user',
-    name: { ...newUser.value.name },
-    email: newUser.value.email,
+    name: { first: newUser.value.name.first.trim(), last: (newUser.value.name.last || '').trim() },
+    email: newUser.value.email.trim(),
     tags: [...newUser.value.tags],
-    created_at: new Date().toISOString(),
-    editing: false
+    created_at: new Date().toISOString()
   }
 
   try {
     await db.value.put(userToAdd)
     console.log('Utilisateur ajouté :', userToAdd)
     await fetchUsers()
-    newUser.value = { type: 'user', name: { first: '', last: '' }, email: '', tags: [], created_at: '' }
+
+    // reset formulaire
+    newUser.value = {
+      type: 'user',
+      name: { first: '', last: '' },
+      email: '',
+      tags: [],
+      created_at: ''
+    }
   } catch (error) {
     console.error('Erreur lors de l’ajout :', error)
   }
 }
 
-// Mise à jour (UPDATE)
+/* =========================
+   UPDATE — modifier un document
+   - On relit la dernière révision pour éviter un conflit basique.
+   - On met à jour updated_at.
+   ========================= */
 async function updateUser(user: UserDoc): Promise<void> {
   if (!db.value || !user._id) return
   try {
-    await db.value.put(user)
-    console.log('Utilisateur mis à jour :', user)
+    // Relire la dernière version (rev la plus récente)
+    const latest = await db.value.get(user._id)
+    const toSave: UserDoc = {
+      ...latest,
+      type: 'user',
+      name: { first: user.name.first.trim(), last: (user.name.last || '').trim() },
+      email: user.email.trim(),
+      tags: Array.isArray(user.tags) ? [...user.tags] : [],
+      created_at: latest.created_at, // on conserve la date de création
+      updated_at: new Date().toISOString()
+    }
+
+    await db.value.put(toSave)
+    console.log('Utilisateur mis à jour :', toSave)
     user.editing = false
     await fetchUsers()
   } catch (error) {
+    // Conflit 409 ? On peut conseiller de recharger/fusionner si besoin
     console.error('Erreur lors de la mise à jour :', error)
+    alert('Échec de la mise à jour. Recharge les données et réessaie.')
   }
 }
 
-// Suppression (DELETE)
+/* =========================
+   DELETE — supprimer un document
+   ========================= */
 async function deleteUser(user: UserDoc): Promise<void> {
-  if (!db.value || !user._id || !user._rev) return
+  if (!db.value || !user._id) return
   try {
-    await db.value.remove(user._id, user._rev)
-    console.log('Utilisateur supprimé :', user._id)
+    const latest = await db.value.get(user._id)
+    await db.value.remove(latest._id!, latest._rev!)
+    console.log('Utilisateur supprimé :', latest._id)
     await fetchUsers()
   } catch (error) {
     console.error('Erreur lors de la suppression :', error)
   }
 }
 
-// Gestion des tags
+/* =========================
+   Tags helpers
+   ========================= */
 function addTag(user: UserDoc, tag: string): void {
   const value = tag.trim()
-  if (value && !user.tags.includes(value)) {
-    user.tags.push(value)
-  }
+  if (!value) return
+  if (!Array.isArray(user.tags)) user.tags = []
+  if (!user.tags.includes(value)) user.tags.push(value)
 }
 
 function removeTag(user: UserDoc, tag: string): void {
+  if (!Array.isArray(user.tags)) return
   user.tags = user.tags.filter(t => t !== tag)
 }
 
 function onTagEnter(user: UserDoc, event: KeyboardEvent): void {
   const input = event.target as HTMLInputElement
-  const value = input.value.trim()
+  const value = (input?.value || '').trim()
   if (value) {
     addTag(user, value)
     input.value = ''
   }
 }
 
-// Montage initial
-onMounted(() => {
+/* =========================
+   Cycle de vie
+   ========================= */
+onMounted(async () => {
   connectToCouchDB()
-  setTimeout(fetchUsers, 500)
+  await fetchUsers()
 })
 </script>
 
 <template>
-  <section style="padding:2rem;background:#f9f9f9;">
-    <h1>Gestion de la base CouchDB</h1>
+  <section style="padding:2rem;background:#f9f9f9;max-width:900px;margin:0 auto;">
+    <h1 style="margin-bottom:1rem;">Gestion de la base CouchDB (vini)</h1>
 
     <!-- Formulaire d'ajout -->
-    <form @submit.prevent="addUser" style="margin-bottom:2rem;padding:1rem;border:1px solid #ccc;border-radius:8px;">
-      <h3>Ajouter un utilisateur</h3>
-      <div><label>Prénom :</label><input v-model="newUser.name.first" required /></div>
-      <div><label>Nom :</label><input v-model="newUser.name.last" /></div>
-      <div><label>Email :</label><input v-model="newUser.email" required /></div>
-      <div>
-        <label>Tags :</label>
+    <form
+      @submit.prevent="addUser"
+      style="margin-bottom:2rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fff;"
+    >
+      <h3 style="margin:0 0 1rem;">Ajouter un utilisateur</h3>
+
+      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+        <label style="flex:1 1 180px;">Prénom
+          <input v-model="newUser.name.first" required style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+        </label>
+        <label style="flex:1 1 180px;">Nom
+          <input v-model="newUser.name.last" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+        </label>
+        <label style="flex:2 1 240px;">Email
+          <input v-model="newUser.email" required style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+        </label>
+      </div>
+
+      <div style="margin-top:0.6rem;">
+        <label>Tags</label>
         <input
           @keyup.enter.prevent="onTagEnter(newUser, $event)"
-          placeholder="Appuyer sur Entrée pour ajouter un tag"
+          placeholder="Entrer un tag puis Entrée"
+          style="padding:0.4rem;margin-left:0.6rem;min-width:280px;"
         />
         <span
           v-for="tag in newUser.tags"
-          :key="tag"
-          style="margin:0 0.3rem; background:#e0e0e0; padding:0.2rem 0.5rem; border-radius:5px;"
+          :key="`new-${tag}`"
+          style="display:inline-flex;align-items:center;margin:0.3rem; background:#eef; padding:0.2rem 0.5rem; border-radius:12px;"
         >
           {{ tag }}
-          <button @click.prevent="removeTag(newUser, tag)">x</button>
+          <button @click.prevent="removeTag(newUser, tag)" style="margin-left:0.4rem;">x</button>
         </span>
       </div>
-      <button type="submit">Ajouter</button>
+
+      <div style="margin-top:0.8rem;">
+        <button type="submit">Ajouter</button>
+      </div>
     </form>
 
     <!-- Liste -->
-    <div v-if="users.length === 0"><p>Aucune donnée trouvée dans la base.</p></div>
+    <div v-if="users.length === 0">
+      <p>Aucune donnée trouvée dans la base.</p>
+    </div>
 
     <article
       v-for="user in users"
       :key="user._id"
-      style="margin-bottom:1rem;padding:1rem;border:1px solid #ccc;border-radius:8px;"
+      style="margin-bottom:1rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fff;"
     >
-      <!-- Lecture -->
+      <!-- Mode lecture -->
       <div v-if="!user.editing">
-        <h2>{{ user.name.first }} {{ user.name.last }}</h2>
-        <p><strong>Email :</strong> {{ user.email }}</p>
-        <p><strong>Tags :</strong> {{ user.tags.join(', ') }}</p>
-        <small><strong>Créé le :</strong> {{ new Date(user.created_at).toLocaleString() }}</small>
-        <div style="margin-top:0.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;flex-wrap:wrap;">
+          <div>
+            <h2 style="margin:0 0 0.3rem;">
+              {{ user.name.first || '—' }} {{ user.name.last || '' }}
+            </h2>
+            <p style="margin:0.2rem 0;"><strong>Email :</strong> {{ user.email }}</p>
+            <p style="margin:0.2rem 0;">
+              <strong>Tags :</strong>
+              <template v-if="user.tags && user.tags.length">
+                {{ user.tags.join(', ') }}
+              </template>
+              <template v-else>—</template>
+            </p>
+          </div>
+          <div style="text-align:right;min-width:240px;">
+            <small style="display:block;"><strong>Créé le :</strong> {{ new Date(user.created_at).toLocaleString() }}</small>
+            <small v-if="user.updated_at" style="display:block;"><strong>Modifié le :</strong> {{ new Date(user.updated_at).toLocaleString() }}</small>
+          </div>
+        </div>
+
+        <div style="margin-top:0.6rem;">
           <button @click="user.editing = true">Modifier</button>
-          <button @click="deleteUser(user)">Supprimer</button>
+          <button @click="deleteUser(user)" style="margin-left:0.4rem;">Supprimer</button>
         </div>
       </div>
 
-      <!-- Édition -->
+      <!-- Mode édition -->
       <div v-else>
-        <h3>Éditer utilisateur</h3>
-        <label>Prénom :</label><input v-model="user.name.first" />
-        <label>Nom :</label><input v-model="user.name.last" />
-        <label>Email :</label><input v-model="user.email" />
-        <div>
-          <label>Tags :</label>
-          <input @keyup.enter.prevent="onTagEnter(user, $event)" placeholder="Entrer un tag et appuyer sur Entrée" />
+        <h3 style="margin:0 0 0.6rem;">Éditer l’utilisateur</h3>
+
+        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
+          <label style="flex:1 1 180px;">Prénom
+            <input v-model="user.name.first" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+          </label>
+          <label style="flex:1 1 180px;">Nom
+            <input v-model="user.name.last" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+          </label>
+          <label style="flex:2 1 240px;">Email
+            <input v-model="user.email" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
+          </label>
+        </div>
+
+        <div style="margin-top:0.6rem;">
+          <label>Tags</label>
+          <input
+            @keyup.enter.prevent="onTagEnter(user, $event)"
+            placeholder="Entrer un tag puis Entrée"
+            style="padding:0.4rem;margin-left:0.6rem;min-width:280px;"
+          />
           <span
             v-for="tag in user.tags"
-            :key="tag"
-            style="margin:0 0.3rem; background:#e0e0e0; padding:0.2rem 0.5rem; border-radius:5px;"
+            :key="`${user._id}-${tag}`"
+            style="display:inline-flex;align-items:center;margin:0.3rem; background:#eef; padding:0.2rem 0.5rem; border-radius:12px;"
           >
             {{ tag }}
-            <button @click.prevent="removeTag(user, tag)">x</button>
+            <button @click.prevent="removeTag(user, tag)" style="margin-left:0.4rem;">x</button>
           </span>
         </div>
-        <div style="margin-top:0.5rem;">
+
+        <div style="margin-top:0.8rem;">
           <button @click="updateUser(user)">Sauvegarder</button>
-          <button @click="user.editing = false">Annuler</button>
+          <button @click="user.editing = false" style="margin-left:0.4rem;">Annuler</button>
         </div>
       </div>
     </article>
@@ -211,17 +312,15 @@ onMounted(() => {
 </template>
 
 <style scoped>
-h1 {
-  color: #333;
-  margin-bottom: 1rem;
-}
-input {
-  margin: 0.3rem;
-  padding: 0.25rem;
-}
 button {
-  margin-left: 0.3rem;
-  padding: 0.3rem 0.6rem;
-  cursor: pointer;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid #ccc;
+  background: #f6f6f6;
+  border-radius: 6px;
+}
+button:hover { background: #eee; }
+input {
+  border: 1px solid #ccc;
+  border-radius: 6px;
 }
 </style>
