@@ -18,6 +18,7 @@
   "dependencies": {
     "events": "^3.3.0",
     "pouchdb": "^9.0.0",
+    "pouchdb-find": "^9.0.0",
     "vue": "^3.5.22"
   },
   "devDependencies": {
