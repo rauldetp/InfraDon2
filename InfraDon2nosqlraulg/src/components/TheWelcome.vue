@@ -3,607 +3,555 @@ import { ref, onMounted } from 'vue'
 import PouchDB from 'pouchdb'
 import PouchDBFind from 'pouchdb-find'
 
-/**
- * Typage de PouchDB avec la méthode plugin (évite le "as any")
- */
-type PouchWithPlugin = typeof PouchDB & {
-  plugin: (plugin: unknown) => void
+  ; (PouchDB as unknown as { plugin: (p: unknown) => void }).plugin(PouchDBFind)
+
+/* -------------------------------------------------------
+ * TYPES
+ * ----------------------------------------------------- */
+
+interface InfraComment {
+  text: string
+  created_at: string
 }
 
-// Activation du plugin pouchdb-find (createIndex / find)
-;(PouchDB as PouchWithPlugin).plugin(PouchDBFind)
-
-/** Modèle strict d'un utilisateur dans nos bases (locale + distante) */
-interface UserDoc {
-  _id?: string          // identifiant du document
-  _rev?: string         // révision (gérée par CouchDB / PouchDB)
-  type: 'user'
-  name: {
-    first: string
-    last: string
-  }
-  email: string
-  tags: string[]
-  created_at: string    // date de création
-  updated_at?: string   // date de dernière modification (facultative)
-  editing?: boolean     // utilisé uniquement dans l'UI (mode édition)
+interface InfraDoc {
+  _id?: string
+  _rev?: string
+  name: string
+  content: string
+  created_at: string
+  updated_at?: string
+  likes: number
+  comments: InfraComment[]
 }
 
-/**
- * Typage de la base locale avec les méthodes ajoutées par pouchdb-find
- * (createIndex, find)
- */
-type LocalDB = PouchDB.Database<UserDoc> & {
-  createIndex: (def: { index: { fields: string[] } }) => Promise<unknown>
+/* PouchDB types */
+type LocalDB = PouchDB.Database<InfraDoc> & {
+  createIndex: (opt: { index: { fields: string[] } }) => Promise<unknown>
   find: (query: {
     selector: Record<string, unknown>
-    sort?: string[]
-  }) => Promise<{ docs: UserDoc[] }>
+    sort?: Array<Record<string, 'asc' | 'desc'>>
+  }) => Promise<{ docs: InfraDoc[] }>
 }
 
-/* =========================
-   Bases locales / distantes
-   ========================= */
+/* -------------------------------------------------------
+ * STATE
+ * ----------------------------------------------------- */
 
-// Base PouchDB locale (dans le navigateur)
+const LOCAL_DB = 'vini_local'
+const REMOTE_DB = 'http://admin:MbappeVini135@127.0.0.1:5984/vini'
+
 const localDb = ref<LocalDB | null>(null)
+const remoteDb = ref<PouchDB.Database<InfraDoc> | null>(null)
 
-// Base CouchDB distante (serveur)
-const remoteDb = ref<PouchDB.Database<UserDoc> | null>(null)
+const docs = ref<InfraDoc[]>([])
+const loading = ref(false)
+const error = ref('')
 
-// Liste des utilisateurs affichés dans l'UI
-const users = ref<UserDoc[]>([])
+const online = ref(true)
+const isSyncing = ref(false)
 
-// États pour l'interface
-const offline = ref(false)   // true = mode offline (pas de sync)
-const searchTerm = ref('')   // texte de recherche (sur email)
-const isSyncing = ref(false) // indique si une synchronisation est active
-
-// Handler retourné par .sync() pour pouvoir annuler la réplication
-let syncHandler: PouchDB.Replication.Sync<UserDoc> | null = null
-
-/* =========================
-   Formulaire d'ajout
-   ========================= */
-
-// Modèle local pour le formulaire "Ajouter un utilisateur"
-const newUser = ref<UserDoc>({
-  type: 'user',
-  name: { first: '', last: '' },
-  email: '',
-  tags: [],
-  created_at: ''
+const form = ref({
+  _id: '',
+  _rev: '',
+  name: '',
+  content: ''
 })
+const isEdit = ref(false)
 
-/* =========================
-   INIT : bases + index + sync
-   ========================= */
-async function initDatabases(): Promise<void> {
-  try {
-    // 1) Connexion à la base distante CouchDB (serveur)
-    remoteDb.value = new PouchDB<UserDoc>('http://admin:MbappeVini135@127.0.0.1:5984/vini')
+const searchTerm = ref('')
+const sortByLikes = ref(false)
 
-    // 2) Création/connexion de la base PouchDB locale (dans le navigateur)
-    localDb.value = new PouchDB<UserDoc>('vini_local') as LocalDB
+const commentDrafts = ref<Record<string, string>>({})
 
-    // 3) Création d'un index sur le champ "email" dans la base locale
-    await localDb.value.createIndex({
-      index: { fields: ['email'] }
-    })
-    console.log('Index sur "email" créé dans la base locale')
+let syncHandler: PouchDB.Replication.Sync<InfraDoc> | null = null
 
-    // 4) Lancer la synchro locale ⇆ distante si on n'est pas offline
-    if (!offline.value) {
-      startSync()
-    }
+/* -------------------------------------------------------
+ * INIT
+ * ----------------------------------------------------- */
 
-    // 5) Charger la liste des utilisateurs depuis la base LOCALE
-    await fetchUsers()
-  } catch (err) {
-    console.error('Erreur lors de l’initialisation des bases :', err)
+function initLocalDb(): LocalDB {
+  if (!localDb.value) {
+    localDb.value = new PouchDB(LOCAL_DB) as LocalDB
+  }
+  return localDb.value
+}
+
+function initRemoteDb(): PouchDB.Database<InfraDoc> {
+  if (!remoteDb.value) {
+    remoteDb.value = new PouchDB(REMOTE_DB)
+  }
+  return remoteDb.value
+}
+
+/* -------------------------------------------------------
+ * NORMALISATION
+ * ----------------------------------------------------- */
+
+function normalizeDoc(raw: InfraDoc): InfraDoc {
+  return {
+    ...raw,
+    likes: typeof raw.likes === 'number' ? raw.likes : 0,
+    comments: Array.isArray(raw.comments) ? raw.comments : []
   }
 }
 
-/* =========================
-   RÉPLICATION (sync locale ⇆ distante)
-   ========================= */
+/* -------------------------------------------------------
+ * INDEXES
+ * ----------------------------------------------------- */
 
-// Démarrage de la synchronisation bidirectionnelle (live + retry)
-function startSync(): void {
-  if (!localDb.value || !remoteDb.value || syncHandler) return
+async function ensureIndexes(): Promise<void> {
+  const db = initLocalDb()
+  await db.createIndex({ index: { fields: ['name'] } })
+  await db.createIndex({ index: { fields: ['likes'] } })
+}
 
-  console.log('Démarrage de la synchronisation locale ⇆ distante')
+/* -------------------------------------------------------
+ * FETCH DOCS
+ * ----------------------------------------------------- */
+
+async function fetchDocs(): Promise<void> {
+  const db = initLocalDb()
+  loading.value = true
+  error.value = ''
+
+  try {
+    if (sortByLikes.value) {
+      const res = await db.find({
+        selector: { likes: { $gte: 0 } },
+        sort: [{ likes: 'desc' }]
+      })
+      docs.value = res.docs.map(normalizeDoc)
+    } else {
+      const res = await db.allDocs({ include_docs: true })
+      docs.value = res.rows
+        .map(r => normalizeDoc(r.doc as InfraDoc))
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() -
+            new Date(a.created_at).getTime()
+        )
+    }
+  } catch (e) {
+    const err = e as Error
+    error.value = err.message
+  } finally {
+    loading.value = false
+  }
+}
+
+/* -------------------------------------------------------
+ * CRUD
+ * ----------------------------------------------------- */
+
+function resetForm(): void {
+  isEdit.value = false
+  form.value = {
+    _id: '',
+    _rev: '',
+    name: '',
+    content: ''
+  }
+}
+
+async function createDoc(): Promise<void> {
+  const db = initLocalDb()
+
+  const newDoc: InfraDoc = {
+    name: form.value.name.trim(),
+    content: form.value.content.trim(),
+    created_at: new Date().toISOString(),
+    likes: 0,
+    comments: []
+  }
+
+  await db.post(newDoc)
+  await fetchDocs()
+  resetForm()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+function startEdit(doc: InfraDoc): void {
+  isEdit.value = true
+  form.value._id = doc._id ?? ''
+  form.value._rev = doc._rev ?? ''
+  form.value.name = doc.name
+  form.value.content = doc.content
+}
+
+async function updateDoc(): Promise<void> {
+  if (!form.value._id) return
+
+  const db = initLocalDb()
+  const latest = await db.get(form.value._id)
+  const normalized = normalizeDoc(latest as InfraDoc)
+
+  const updated: InfraDoc = {
+    ...normalized,
+    name: form.value.name.trim(),
+    content: form.value.content.trim(),
+    updated_at: new Date().toISOString()
+  }
+
+  await db.put(updated)
+  await fetchDocs()
+  resetForm()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+async function deleteDoc(doc: InfraDoc): Promise<void> {
+  const db = initLocalDb()
+  if (!doc._id) return
+
+  const latest = await db.get(doc._id)
+  await db.remove(latest._id as string, latest._rev as string)
+
+  await fetchDocs()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+async function submitForm(): Promise<void> {
+  if (isEdit.value) {
+    await updateDoc()
+  } else {
+    await createDoc()
+  }
+}
+
+/* -------------------------------------------------------
+ * LIKES
+ * ----------------------------------------------------- */
+
+async function likeDoc(doc: InfraDoc): Promise<void> {
+  const db = initLocalDb()
+
+  const latest = await db.get(doc._id!)
+  const normalized = normalizeDoc(latest as InfraDoc)
+
+  const updated: InfraDoc = {
+    ...normalized,
+    likes: normalized.likes + 1
+  }
+
+  await db.put(updated)
+  await fetchDocs()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+function toggleSortLikes(): void {
+  sortByLikes.value = !sortByLikes.value
+  void fetchDocs()
+}
+
+/* -------------------------------------------------------
+ * COMMENTAIRES
+ * ----------------------------------------------------- */
+
+function getDraft(id: string): string {
+  return commentDrafts.value[id] ?? ''
+}
+
+function onCommentInput(id: string, e: Event) {
+  const target = e.target as HTMLInputElement
+  commentDrafts.value[id] = target.value
+}
+
+async function addComment(doc: InfraDoc): Promise<void> {
+  const db = initLocalDb()
+  const draft = getDraft(doc._id!)
+
+  if (!draft.trim()) return
+
+  const latest = await db.get(doc._id!)
+  const normalized = normalizeDoc(latest as InfraDoc)
+
+  const newComment: InfraComment = {
+    text: draft.trim(),
+    created_at: new Date().toISOString()
+  }
+
+  const updated: InfraDoc = {
+    ...normalized,
+    comments: [...normalized.comments, newComment]
+  }
+
+  await db.put(updated)
+  commentDrafts.value[doc._id!] = ''
+  await fetchDocs()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+/* -------------------------------------------------------
+ * SEARCH INDEXÉE (name)
+ * ----------------------------------------------------- */
+
+async function onSearch(): Promise<void> {
+  const db = initLocalDb()
+  const term = searchTerm.value.trim()
+
+  if (!term) return fetchDocs()
+
+  const res = await db.find({
+    selector: { name: { $eq: term } }
+  })
+
+  docs.value = res.docs.map(normalizeDoc)
+}
+
+/* -------------------------------------------------------
+ * FACTORY
+ * ----------------------------------------------------- */
+
+async function generateFake(n = 50): Promise<void> {
+  const db = initLocalDb()
+  const now = Date.now()
+  const data: InfraDoc[] = []
+
+  for (let i = 0; i < n; i++) {
+    data.push({
+      _id: `fake_${now}_${i}`,
+      name: `Doc ${i}`,
+      content: `Contenu numéro ${i}`,
+      created_at: new Date().toISOString(),
+      likes: Math.floor(Math.random() * 10),
+      comments: []
+    })
+  }
+
+  await db.bulkDocs(data)
+  await fetchDocs()
+
+  if (online.value) {
+    await manualSync()
+  }
+}
+
+/* -------------------------------------------------------
+ * REPLICATION
+ * ----------------------------------------------------- */
+
+async function replicateFromRemote(): Promise<void> {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+  await local.replicate.from(remote)
+  await fetchDocs()
+}
+
+async function replicateToRemote(): Promise<void> {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+  await local.replicate.to(remote)
+}
+
+async function manualSync(): Promise<void> {
+  await replicateFromRemote()
+  await replicateToRemote()
+}
+
+/* -------------------------------------------------------
+ * LIVE SYNC
+ * ----------------------------------------------------- */
+
+function startLiveSync(): void {
+  const local = initLocalDb()
+  const remote = initRemoteDb()
+
+  if (syncHandler) return
+
   isSyncing.value = true
 
-  syncHandler = localDb.value
-    .sync(remoteDb.value, {
-      live: true,   // réplication continue
-      retry: true   // réessaie en cas d’erreur réseau
-    })
+  syncHandler = local
+    .sync(remote, { live: true, retry: true })
     .on('change', () => {
-      console.log('Changement détecté via sync → rafraîchissement')
-      // Si une recherche est active, on relance la recherche
-      // sinon, on recharge tous les docs
-      if (searchTerm.value.trim()) {
-        runSearch()
-      } else {
-        fetchUsers()
-      }
+      void fetchDocs()
     })
-    .on('paused', info => {
-      console.log('Sync pausée :', info)
-    })
-    .on('active', () => {
-      console.log('Sync active')
-    })
-    .on('error', err => {
-      console.error('Erreur de synchronisation :', err)
+    .on('error', () => {
       isSyncing.value = false
     })
 }
 
-// Arrêt de la synchronisation (utilisé pour le mode offline)
-function stopSync(): void {
-  if (syncHandler) {
-    console.log('Arrêt de la synchronisation')
-    syncHandler.cancel()
-    syncHandler = null
-  }
+function stopLiveSync(): void {
+  syncHandler?.cancel()
+  syncHandler = null
   isSyncing.value = false
 }
 
-// Toggle du mode offline/online
-function toggleOfflineMode(): void {
-  offline.value = !offline.value
-  if (offline.value) {
-    // En mode offline, on coupe la synchronisation
-    stopSync()
+async function toggleOnline(): Promise<void> {
+  online.value = !online.value
+
+  if (online.value) {
+    await manualSync()
+    startLiveSync()
   } else {
-    // Lorsque l'on repasse en online, on relance la sync
-    startSync()
+    stopLiveSync()
   }
 }
 
-/* =========================
-   READ — récupérer depuis la base locale
-   ========================= */
-async function fetchUsers(): Promise<void> {
-  if (!localDb.value) return
-  try {
-    const result = await localDb.value.allDocs({ include_docs: true })
-    users.value = result.rows
-      .filter(r => r.doc)
-      .map(r => {
-        const d = r.doc as UserDoc
-        // on force editing = false pour ne pas rester en mode édition
-        return { ...d, editing: false }
-      })
-      // tri par date de création décroissante (les plus récents en premier)
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-  } catch (error) {
-    console.error('Erreur de lecture (allDocs local) :', error)
-  }
-}
+/* -------------------------------------------------------
+ * MOUNT
+ * ----------------------------------------------------- */
 
-/* =========================
-   CREATE — ajout dans la base locale
-   (sera répliqué vers CouchDB quand online)
-   ========================= */
-async function addUser(): Promise<void> {
-  if (!localDb.value) return
-
-  // Validation minimale
-  if (!newUser.value.name.first.trim() || !newUser.value.email.trim()) {
-    alert('Prénom et email sont obligatoires.')
-    return
-  }
-
-  // Construction d’un id unique : user:prenom.nom:timestamp
-  const baseId = `user:${newUser.value.name.first.toLowerCase()}.${(newUser.value.name.last || '').toLowerCase()}`
-  const _id = `${baseId}:${Date.now()}`
-
-  const userToAdd: UserDoc = {
-    _id,
-    type: 'user',
-    name: {
-      first: newUser.value.name.first.trim(),
-      last: (newUser.value.name.last || '').trim()
-    },
-    email: newUser.value.email.trim(),
-    tags: [...newUser.value.tags],
-    created_at: new Date().toISOString()
-  }
-
-  try {
-    // On ajoute dans la base LOCALE uniquement
-    await localDb.value.put(userToAdd)
-    console.log('Utilisateur ajouté en local :', userToAdd)
-
-    // Si pas de recherche, on recharge tout, sinon on met juste à jour la recherche
-    if (!searchTerm.value.trim()) {
-      await fetchUsers()
-    } else {
-      await runSearch()
-    }
-
-    // Reset du formulaire
-    newUser.value = {
-      type: 'user',
-      name: { first: '', last: '' },
-      email: '',
-      tags: [],
-      created_at: ''
-    }
-  } catch (error) {
-    console.error('Erreur lors de l’ajout en local :', error)
-  }
-}
-
-/* =========================
-   UPDATE — modifier un document (local)
-   ========================= */
-async function updateUser(user: UserDoc): Promise<void> {
-  if (!localDb.value || !user._id) return
-  try {
-    // On récupère la dernière version du doc pour avoir la bonne _rev
-    const latest = await localDb.value.get(user._id)
-
-    const toSave: UserDoc = {
-      ...latest, // contient _id, _rev, created_at, etc.
-      type: 'user',
-      name: {
-        first: user.name.first.trim(),
-        last: (user.name.last || '').trim()
-      },
-      email: user.email.trim(),
-      tags: Array.isArray(user.tags) ? [...user.tags] : [],
-      created_at: latest.created_at,
-      updated_at: new Date().toISOString()
-    }
-
-    // Mise à jour dans la base locale
-    await localDb.value.put(toSave)
-    console.log('Utilisateur mis à jour en local :', toSave)
-    user.editing = false
-
-    // Mise à jour de la liste ou des résultats de recherche
-    if (!searchTerm.value.trim()) {
-      await fetchUsers()
-    } else {
-      await runSearch()
-    }
-  } catch (error) {
-    console.error('Erreur lors de la mise à jour :', error)
-    alert('Échec de la mise à jour. Recharge les données et réessaie.')
-  }
-}
-
-/* =========================
-   DELETE — supprimer un document (local)
-   ========================= */
-async function deleteUser(user: UserDoc): Promise<void> {
-  if (!localDb.value || !user._id) return
-  try {
-    // On récupère la dernière version pour avoir la _rev
-    const latest = await localDb.value.get(user._id)
-    await localDb.value.remove(latest._id!, latest._rev!)
-    console.log('Utilisateur supprimé (local) :', latest._id)
-
-    if (!searchTerm.value.trim()) {
-      await fetchUsers()
-    } else {
-      await runSearch()
-    }
-  } catch (error) {
-    console.error('Erreur lors de la suppression :', error)
-  }
-}
-
-/* =========================
-   TAGS helpers (ajout / suppression de tags)
-   ========================= */
-function addTag(user: UserDoc, tag: string): void {
-  const value = tag.trim()
-  if (!value) return
-  if (!Array.isArray(user.tags)) user.tags = []
-  if (!user.tags.includes(value)) user.tags.push(value)
-}
-
-function removeTag(user: UserDoc, tag: string): void {
-  if (!Array.isArray(user.tags)) return
-  user.tags = user.tags.filter(t => t !== tag)
-}
-
-function onTagEnter(user: UserDoc, e: KeyboardEvent): void {
-  const target = e.target as HTMLInputElement | null
-  const value = target?.value?.trim() ?? ''
-  if (!value) return
-  addTag(user, value)
-  if (target) {
-    target.value = ''
-  }
-}
-
-/* =========================
-   INDEXATION / RECHERCHE (pouchdb-find sur email)
-   ========================= */
-async function runSearch(): Promise<void> {
-  if (!localDb.value) return
-
-  const term = searchTerm.value.trim()
-  if (!term) {
-    // Si le champ de recherche est vide, on recharge tous les docs
-    await fetchUsers()
-    return
-  }
-
-  try {
-    // On cherche les emails qui commencent par "term" (préfixe)
-    const lower = term.toLowerCase()
-    const res = await localDb.value.find({
-      selector: {
-        email: { $gte: lower, $lte: lower + '\uffff' }
-      },
-      sort: ['email']
-    })
-
-    users.value = res.docs
-      .map(d => ({ ...d, editing: false }))
-      .sort((a, b) => a.email.localeCompare(b.email))
-  } catch (err) {
-    console.error('Erreur lors de la recherche :', err)
-  }
-}
-
-/* =========================
-   FACTORY — génération de faux utilisateurs
-   ========================= */
-   function buildFakeUser(index: number): UserDoc {
-  const firstNames: string[] = ['Kylian', 'Bukayo', 'Vinicius', 'Erling', 'Jude', 'Lamine']
-  const lastNames: string[] = ['Mbappe', 'Saka', 'Junior', 'Haaland', 'Bellingham', 'Yamal']
-
-  const first: string =
-    firstNames[Math.floor(Math.random() * firstNames.length)] ?? ''
-  const last: string =
-    lastNames[Math.floor(Math.random() * lastNames.length)] ?? ''
-
-  const email: string = `${first.toLowerCase()}.${last.toLowerCase()}.${index}@heig-vd.ch`
-
-  return {
-    type: 'user',
-    name: { first, last },
-    email,
-    tags: ['factory'],
-    created_at: new Date().toISOString()
-  }
-}
-
-// Ajoute "count" faux utilisateurs dans la base locale (pour tester indexation + sync)
-async function populateFactory(count = 20): Promise<void> {
-  if (!localDb.value) return
-  const docs: UserDoc[] = []
-
-  for (let i = 0; i < count; i++) {
-    const fake = buildFakeUser(i)
-    // _id unique par doc factory
-    fake._id = `factory:${fake.email}:${Date.now()}:${i}`
-    docs.push(fake)
-  }
-
-  try {
-    await localDb.value.bulkDocs(docs)
-    console.log(`${count} faux utilisateurs ajoutés en local`)
-    if (!searchTerm.value.trim()) {
-      await fetchUsers()
-    } else {
-      await runSearch()
-    }
-  } catch (err) {
-    console.error('Erreur factory bulkDocs :', err)
-  }
-}
-
-/* =========================
-   CYCLE DE VIE DU COMPOSANT
-   ========================= */
 onMounted(async () => {
-  await initDatabases()
-})
+  initLocalDb()
+  initRemoteDb()
 
-/* =========================
-   Hack pour TS/ESLint :
-   on indique explicitement que ces fonctions
-   sont utilisées (dans le template)
-   ========================= */
-void removeTag
-void onTagEnter
+  await ensureIndexes()
+  await manualSync()
+  await fetchDocs()
+
+  startLiveSync()
+})
 </script>
 
 <template>
-  <section style="padding:2rem;background:#f9f9f9;max-width:1000px;margin:0 auto;">
-    <!-- Header avec titre + toggle offline + état de sync -->
-    <header style="display:flex;justify-content:space-between;align-items:center;gap:1rem;flex-wrap:wrap;">
-      <h1 style="margin:0;">Réplication &amp; Indexation – base CouchDB "vini"</h1>
+  <section style="padding:2rem;background:#fafafa;max-width:1000px;margin:0 auto;">
+    <header style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:1rem;">
+      <h1>InfraDon2 — CRUD + Réplication</h1>
 
-      <div style="display:flex;align-items:center;gap:1rem;">
-        <!-- Toggle offline -->
-        <label style="display:flex;align-items:center;gap:0.4rem;cursor:pointer;">
-          <input type="checkbox" :checked="offline" @change="toggleOfflineMode" />
-          <span>Mode offline</span>
+      <div style="display:flex;gap:1rem;align-items:center;">
+        <label style="display:flex;align-items:center;gap:0.4rem;">
+          <input type="checkbox" :checked="online" @change="toggleOnline" />
+          <span>{{ online ? 'ONLINE' : 'OFFLINE' }}</span>
         </label>
-        <!-- Badge d'état de la synchronisation -->
-        <span
-          :style="{
-            padding: '0.2rem 0.6rem',
-            borderRadius: '999px',
-            fontSize: '0.8rem',
-            background: isSyncing && !offline ? '#d4fdd4' : '#f5d7d7',
-            border: '1px solid #ccc'
-          }"
-        >
-          Sync : {{ !offline && isSyncing ? 'active' : 'inactive' }}
+
+        <span :style="{
+          padding: '0.3rem 0.6rem',
+          borderRadius: '12px',
+          fontSize: '0.8rem',
+          background: online && isSyncing ? '#ccf3cc' : '#f8cccc',
+          border: '1px solid #ccc'
+        }">
+          Sync : {{ online && isSyncing ? 'active' : 'inactive' }}
         </span>
       </div>
     </header>
 
-    <!-- Zone de recherche + factory pour générer des données -->
-    <section
-      style="margin-top:1rem;margin-bottom:1rem;padding:0.8rem 1rem;border-radius:8px;border:1px solid #ddd;background:#fff;display:flex;flex-wrap:wrap;gap:0.8rem;align-items:center;"
-    >
-      <div style="flex:2 1 260px;">
-        <label style="display:block;font-size:0.9rem;margin-bottom:0.2rem;">Recherche par email (indexée)</label>
-        <input
-          v-model="searchTerm"
-          @input="runSearch"
-          placeholder="Commence à taper un email…"
-          style="width:100%;padding:0.4rem;border-radius:6px;border:1px solid #ccc;"
-        />
-      </div>
+    <div v-if="loading" style="margin-top:1rem;color:#666;">Chargement…</div>
+    <div v-if="error" style="margin-top:1rem;color:#c00;">{{ error }}</div>
 
-      <div style="flex:1 1 200px;display:flex;gap:0.4rem;flex-wrap:wrap;">
-        <button type="button" @click="populateFactory(5)">+5 faux users</button>
-        <button type="button" @click="populateFactory(20)">+20 faux users</button>
-      </div>
+    <!-- BARRE DE RÉPLICATION -->
+    <section style="margin-top:1.5rem;padding:1rem;background:#fff;border:1px solid #ccc;border-radius:8px;">
+      <h2 style="margin-top:0;">Réplication manuelle</h2>
+      <button @click="replicateFromRemote">distant → local</button>
+      <button @click="replicateToRemote" style="margin-left:0.5rem;">local → distant</button>
+      <button @click="manualSync" style="margin-left:0.5rem;">sync (2 sens)</button>
     </section>
 
-    <!-- Formulaire d'ajout d'utilisateur -->
-    <form
-      @submit.prevent="addUser"
-      style="margin-bottom:2rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fff;"
-    >
-      <h3 style="margin:0 0 1rem;">Ajouter un utilisateur (local → répliqué)</h3>
+    <!-- FORM CRUD -->
+    <form @submit.prevent="submitForm"
+      style="margin-top:1.5rem;padding:1rem;background:#fff;border:1px solid #ccc;border-radius:8px;">
+      <h2>{{ isEdit ? 'Modifier' : 'Créer' }}</h2>
 
-      <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-        <label style="flex:1 1 180px;">Prénom
-          <input v-model="newUser.name.first" required style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-        </label>
-        <label style="flex:1 1 180px;">Nom
-          <input v-model="newUser.name.last" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-        </label>
-        <label style="flex:2 1 240px;">Email
-          <input v-model="newUser.email" required style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-        </label>
-      </div>
+      <label>
+        Nom :
+        <input v-model="form.name" required style="width:100%;margin-top:0.2rem;" />
+      </label>
 
-      <div style="margin-top:0.6rem;">
-        <label>Tags</label>
-        <input
-          @keyup.enter.prevent="onTagEnter(newUser, $event)"
-          placeholder="Entrer un tag puis Entrée"
-          style="padding:0.4rem;margin-left:0.6rem;min-width:280px;"
-        />
-        <span
-          v-for="tag in newUser.tags"
-          :key="`new-${tag}`"
-          style="display:inline-flex;align-items:center;margin:0.3rem; background:#eef; padding:0.2rem 0.5rem; border-radius:12px;"
-        >
-          {{ tag }}
-          <button @click.prevent="removeTag(newUser, tag)" style="margin-left:0.4rem;">x</button>
-        </span>
-      </div>
+      <label style="margin-top:1rem;">
+        Contenu :
+        <textarea v-model="form.content" required style="width:100%;min-height:70px;margin-top:0.2rem;"></textarea>
+      </label>
 
-      <div style="margin-top:0.8rem;">
-        <button type="submit">Ajouter</button>
+      <div style="margin-top:1rem;">
+        <button type="submit">{{ isEdit ? 'Enregistrer' : 'Créer' }}</button>
+
+        <button v-if="isEdit" type="button" @click="resetForm" style="margin-left:0.5rem;">
+          Annuler
+        </button>
+
+        <button type="button" @click="generateFake(50)" style="margin-left:0.5rem;">
+          Générer 50 docs
+        </button>
       </div>
     </form>
 
-    <!-- Liste des utilisateurs -->
-    <div v-if="users.length === 0">
-      <p>Aucune donnée trouvée dans la base locale.</p>
-    </div>
+    <!-- RECHERCHE + TRI -->
+    <section style="margin-top:1.5rem;padding:1rem;background:#fff;border:1px solid #ccc;border-radius:8px;">
+      <h2>Recherche (indexée)</h2>
 
-    <article
-      v-for="user in users"
-      :key="user._id"
-      style="margin-bottom:1rem;padding:1rem;border:1px solid #ddd;border-radius:8px;background:#fff;"
-    >
-      <!-- Mode lecture (affichage normal) -->
-      <div v-if="!user.editing">
-        <div style="display:flex;justify-content:space-between;align-items:start;gap:1rem;flex-wrap:wrap;">
-          <div>
-            <h2 style="margin:0 0 0.3rem;">
-              {{ user.name.first || '—' }} {{ user.name.last || '' }}
-            </h2>
-            <p style="margin:0.2rem 0;"><strong>Email :</strong> {{ user.email }}</p>
-            <p style="margin:0.2rem 0;">
-              <strong>Tags :</strong>
-              <template v-if="user.tags && user.tags.length">
-                {{ user.tags.join(', ') }}
-              </template>
-              <template v-else>—</template>
-            </p>
-          </div>
-          <div style="text-align:right;min-width:240px;">
-            <small style="display:block;">
-              <strong>Créé le :</strong> {{ new Date(user.created_at).toLocaleString() }}
-            </small>
-            <small v-if="user.updated_at" style="display:block;">
-              <strong>Modifié le :</strong> {{ new Date(user.updated_at).toLocaleString() }}
-            </small>
+      <input v-model="searchTerm" @input="onSearch" placeholder="Nom exact…" style="width:100%;padding:0.4rem;" />
+
+      <p style="margin-top:0.5rem;">
+        Tri : <strong>{{ sortByLikes ? 'par likes (index)' : 'par date (local)' }}</strong>
+      </p>
+
+      <button @click="toggleSortLikes">
+        {{ sortByLikes ? 'Trier par date' : 'Trier par likes' }}
+      </button>
+    </section>
+
+    <!-- LISTE DOCS -->
+    <section style="margin-top:1.5rem;padding:1rem;background:#fff;border:1px;">
+      <h2>Documents</h2>
+
+      <p v-if="docs.length === 0">Aucun document.</p>
+
+      <div v-for="doc in docs" :key="doc._id"
+        style="margin-bottom:1rem;padding-bottom:1rem;border-bottom:1px solid #ddd;">
+        <h3>{{ doc.name }}</h3>
+        <p>{{ doc.content }}</p>
+
+        <p style="color:#666;font-size:0.85rem;">
+          Créé : {{ doc.created_at }}<br />
+          <span v-if="doc.updated_at">MàJ : {{ doc.updated_at }}<br /></span>
+          Likes : {{ doc.likes }}
+        </p>
+
+        <!-- Commentaires -->
+        <div style="margin-top:0.5rem;">
+          <h4>Commentaires</h4>
+
+          <ul v-if="doc.comments.length">
+            <li v-for="(c, idx) in doc.comments" :key="idx">
+              {{ c.text }}
+              <small style="color:#666;">({{ c.created_at }})</small>
+            </li>
+          </ul>
+
+          <p v-else>Aucun commentaire.</p>
+
+          <div style="margin-top:0.4rem;display:flex;gap:0.5rem;">
+            <input :value="getDraft(doc._id!)" @input="onCommentInput(doc._id!, $event)"
+              placeholder="Ajouter commentaire…" style="flex:1;padding:0.3rem;" />
+            <button @click="addComment(doc)">Ajouter</button>
           </div>
         </div>
 
-        <div style="margin-top:0.6rem;">
-          <button @click="user.editing = true">Modifier</button>
-          <button @click="deleteUser(user)" style="margin-left:0.4rem;">Supprimer</button>
+        <div style="margin-top:0.7rem;">
+          <button @click="startEdit(doc)">Modifier</button>
+          <button @click="deleteDoc(doc)" style="margin-left:0.4rem;">Supprimer</button>
+          <button @click="likeDoc(doc)" style="margin-left:0.4rem;">❤️ Like</button>
         </div>
       </div>
-
-      <!-- Mode édition -->
-      <div v-else>
-        <h3 style="margin:0 0 0.6rem;">Éditer l’utilisateur</h3>
-
-        <div style="display:flex;gap:0.5rem;flex-wrap:wrap;">
-          <label style="flex:1 1 180px;">Prénom
-            <input v-model="user.name.first" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-          </label>
-          <label style="flex:1 1 180px;">Nom
-            <input v-model="user.name.last" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-          </label>
-          <label style="flex:2 1 240px;">Email
-            <input v-model="user.email" style="width:100%;padding:0.4rem;margin-top:0.2rem;" />
-          </label>
-        </div>
-
-        <div style="margin-top:0.6rem;">
-          <label>Tags</label>
-          <input
-            @keyup.enter.prevent="onTagEnter(user, $event)"
-            placeholder="Entrer un tag puis Entrée"
-            style="padding:0.4rem;margin-left:0.6rem;min-width:280px;"
-          />
-          <span
-            v-for="tag in user.tags"
-            :key="`${user._id}-${tag}`"
-            style="display:inline-flex;align-items:center;margin:0.3rem; background:#eef; padding:0.2rem 0.5rem; border-radius:12px;"
-          >
-            {{ tag }}
-            <button @click.prevent="removeTag(user, tag)" style="margin-left:0.4rem;">x</button>
-          </span>
-        </div>
-
-        <div style="margin-top:0.8rem;">
-          <button @click="updateUser(user)">Sauvegarder</button>
-          <button @click="user.editing = false" style="margin-left:0.4rem;">Annuler</button>
-        </div>
-      </div>
-    </article>
+    </section>
   </section>
 </template>
 
 <style scoped>
 button {
-  padding: 0.45rem 0.9rem;
-  border: 1px solid #ccc;
+  padding: 0.4rem 0.8rem;
   background: #f6f6f6;
+  border: 1px solid #ccc;
   border-radius: 6px;
   cursor: pointer;
 }
+
 button:hover {
-  background: #eee;
-}
-input {
-  border: 1px solid #ccc;
-  border-radius: 6px;
+  background: #eaeaea;
 }
 </style>
