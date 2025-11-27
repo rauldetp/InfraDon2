@@ -105,15 +105,17 @@ function normalizeDoc(raw: unknown): InfraDoc {
 }
 
 /* -------------------------------------------------------
- * INDEXES
+ * INDEXES multi-colonnes, sans utiliser de JS.
  * ----------------------------------------------------- */
 
 async function ensureIndexes(): Promise<void> {
   const db = initLocalDb()
-  await db.createIndex({ index: { fields: ['name'] } })
-  await db.createIndex({ index: { fields: ['likes'] } })
-  // index pour le tri par date (sans JS)
-  await db.createIndex({ index: { fields: ['created_at'] } })
+  await db.createIndex({
+  index: {
+    fields: ['name', 'likes', 'created_at']
+  }
+})
+
 }
 
 /* -------------------------------------------------------
