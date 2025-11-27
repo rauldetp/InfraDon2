@@ -3,6 +3,7 @@ import { ref, onMounted } from 'vue'
 import PouchDB from 'pouchdb'
 import PouchDBFind from 'pouchdb-find'
 
+  // Activation du plugin find
   ; (PouchDB as unknown as { plugin: (p: unknown) => void }).plugin(PouchDBFind)
 
 /* -------------------------------------------------------
@@ -88,11 +89,18 @@ function initRemoteDb(): PouchDB.Database<InfraDoc> {
  * NORMALISATION
  * ----------------------------------------------------- */
 
-function normalizeDoc(raw: InfraDoc): InfraDoc {
+function normalizeDoc(raw: unknown): InfraDoc {
+  const doc = raw as Partial<InfraDoc>
+
   return {
-    ...raw,
-    likes: typeof raw.likes === 'number' ? raw.likes : 0,
-    comments: Array.isArray(raw.comments) ? raw.comments : []
+    _id: doc._id,
+    _rev: doc._rev,
+    name: doc.name ?? '',
+    content: doc.content ?? '',
+    created_at: doc.created_at ?? new Date().toISOString(),
+    updated_at: doc.updated_at,
+    likes: typeof doc.likes === 'number' ? doc.likes : 0,
+    comments: Array.isArray(doc.comments) ? (doc.comments as InfraComment[]) : []
   }
 }
 
@@ -104,10 +112,13 @@ async function ensureIndexes(): Promise<void> {
   const db = initLocalDb()
   await db.createIndex({ index: { fields: ['name'] } })
   await db.createIndex({ index: { fields: ['likes'] } })
+  // index pour le tri par date (sans JS)
+  await db.createIndex({ index: { fields: ['created_at'] } })
 }
 
 /* -------------------------------------------------------
  * FETCH DOCS
+ * (tri FAIT PAR POUCHDB, pas par JS)
  * ----------------------------------------------------- */
 
 async function fetchDocs(): Promise<void> {
@@ -117,20 +128,19 @@ async function fetchDocs(): Promise<void> {
 
   try {
     if (sortByLikes.value) {
+      // Tri par likes (indexé)
       const res = await db.find({
         selector: { likes: { $gte: 0 } },
-        sort: [{ likes: 'desc' }]
+        sort: [{ likes: 'desc' }, { created_at: 'desc' }]
       })
       docs.value = res.docs.map(normalizeDoc)
     } else {
-      const res = await db.allDocs({ include_docs: true })
-      docs.value = res.rows
-        .map(r => normalizeDoc(r.doc as InfraDoc))
-        .sort(
-          (a, b) =>
-            new Date(b.created_at).getTime() -
-            new Date(a.created_at).getTime()
-        )
+      // Tri par date (indexé, SANS .sort en JS)
+      const res = await db.find({
+        selector: { created_at: { $gte: '\u0000' } },
+        sort: [{ created_at: 'desc' }]
+      })
+      docs.value = res.docs.map(normalizeDoc)
     }
   } catch (e) {
     const err = e as Error
@@ -187,7 +197,7 @@ async function updateDoc(): Promise<void> {
 
   const db = initLocalDb()
   const latest = await db.get(form.value._id)
-  const normalized = normalizeDoc(latest as InfraDoc)
+  const normalized = normalizeDoc(latest)
 
   const updated: InfraDoc = {
     ...normalized,
@@ -235,7 +245,7 @@ async function likeDoc(doc: InfraDoc): Promise<void> {
   const db = initLocalDb()
 
   const latest = await db.get(doc._id!)
-  const normalized = normalizeDoc(latest as InfraDoc)
+  const normalized = normalizeDoc(latest)
 
   const updated: InfraDoc = {
     ...normalized,
@@ -263,7 +273,7 @@ function getDraft(id: string): string {
   return commentDrafts.value[id] ?? ''
 }
 
-function onCommentInput(id: string, e: Event) {
+function onCommentInput(id: string, e: Event): void {
   const target = e.target as HTMLInputElement
   commentDrafts.value[id] = target.value
 }
@@ -275,7 +285,7 @@ async function addComment(doc: InfraDoc): Promise<void> {
   if (!draft.trim()) return
 
   const latest = await db.get(doc._id!)
-  const normalized = normalizeDoc(latest as InfraDoc)
+  const normalized = normalizeDoc(latest)
 
   const newComment: InfraComment = {
     text: draft.trim(),
@@ -487,7 +497,8 @@ onMounted(async () => {
       <input v-model="searchTerm" @input="onSearch" placeholder="Nom exact…" style="width:100%;padding:0.4rem;" />
 
       <p style="margin-top:0.5rem;">
-        Tri : <strong>{{ sortByLikes ? 'par likes (index)' : 'par date (local)' }}</strong>
+        Tri :
+        <strong>{{ sortByLikes ? 'par likes (index)' : 'par date (index)' }}</strong>
       </p>
 
       <button @click="toggleSortLikes">
